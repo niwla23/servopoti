@@ -1,23 +1,42 @@
-#include <Arduino.h>
-#include <ESP8266WiFi.h>
+#include <ESP8266WiFi.h>  //https://github.com/esp8266/Arduino
+#include <FS.h>           //this needs to be first, or it all crashes and burns...
+// needed for library
+#include <ArduinoJson.h>  //https://github.com/bblanchon/ArduinoJson
+#include <DNSServer.h>
+#include <ESP8266WebServer.h>
 #include <PubSubClient.h>
 #include <Servo.h>
-#include <secrets.hpp>
+#include <WiFiManager.h>  //https://github.com/tzapu/WiFiManager
 
-WiFiClient espClient;
-PubSubClient client(espClient);
-unsigned long lastMsg = 0;
-
-Servo myservo;  // create servo object to control a servo
+// define your default values here, if there are different values in config.json, they are overwritten.
+char mqtt_server[40];
+char mqtt_port[6] = "1883";
+char mqtt_state_topic[100] = "servopotis/1/state";
+char mqtt_cmnd_topic[100] = "servopotis/1/cmnd";
+char mqtt_availability_topic[100] = "servopotis/1/available";
+char invert_servo[2] = "1";
 
 const int servoReadPin = A0;
 const int servoWritePin = D4;
 const int servoMinUs = 400;
 const int servoMaxUs = 2500;
-const bool invert = true;
 
 unsigned int servoValue0Deg, servoValue180Deg;  // Vaiables to store min and max values of servo's pot
 int pos = 0;                                    // variable to store the servo position
+
+// flag for saving data
+bool shouldSaveConfig = false;
+
+// callback notifying us of the need to save config
+void saveConfigCallback() {
+    Serial.println("Should save config");
+    shouldSaveConfig = true;
+}
+
+Servo myservo;
+WiFiClient espClient;
+PubSubClient client(espClient);
+unsigned long lastMsg = 0;
 
 void attachServo() {
     myservo.attach(servoWritePin, servoMinUs, servoMaxUs);
@@ -40,31 +59,9 @@ void calibration() {
     myservo.detach();
 }
 
-void setup_wifi() {
-    delay(10);
-    Serial.println();
-    Serial.print("Connecting to ");
-    Serial.println(ssid);
-
-    WiFi.mode(WIFI_STA);
-    WiFi.begin(ssid, password);
-
-    while (WiFi.status() != WL_CONNECTED) {
-        delay(500);
-        Serial.print(".");
-    }
-
-    randomSeed(micros());
-
-    Serial.println("");
-    Serial.println("WiFi connected");
-    Serial.println("IP address: ");
-    Serial.println(WiFi.localIP());
-}
-
 long get_servo_state() {
     long value = map(analogRead(servoReadPin), servoValue0Deg, servoValue180Deg, 0, 100);
-    if (invert) {
+    if (strcmp(invert_servo, "1") == 0) {
         return 100 - value;
     } else {
         return value;
@@ -74,7 +71,7 @@ long get_servo_state() {
 void write_servo(int pos) {
     attachServo();
 
-    if (invert) {
+    if (strcmp(invert_servo, "1") == 0) {
         pos = 100 - pos;
     }
 
@@ -93,20 +90,19 @@ void callback(char* topic, byte* payload, unsigned int length) {
     write_servo(atoi(payload_char));
 }
 
+// (re)connects to MQTT server
 void reconnect() {
     // Loop until we're reconnected
     while (!client.connected()) {
         Serial.print("Attempting MQTT connection...");
         // Create a random client ID
-        String clientId = "ESP8266Client-";
+        String clientId = "servopoti-";
         clientId += String(random(0xffff), HEX);
         // Attempt to connect
         if (client.connect(clientId.c_str())) {
             Serial.println("connected");
-            // Once connected, publish an announcement...
-            client.publish("outTopic", "hello world");
-            // ... and resubscribe
-            client.subscribe("inTopic");
+            client.publish(mqtt_availability_topic, "online");
+            client.subscribe(mqtt_cmnd_topic);
         } else {
             Serial.print("failed, rc=");
             Serial.print(client.state());
@@ -118,11 +114,135 @@ void reconnect() {
 }
 
 void setup() {
-    setup_wifi();
+    Serial.begin(115200);
+    Serial.println();
+
+    // clean FS, for testing
+    // SPIFFS.format();
+
+    // read configuration from FS json
+    Serial.println("mounting FS...");
+
+    if (SPIFFS.begin()) {
+        Serial.println("mounted file system");
+        if (SPIFFS.exists("/config.json")) {
+            // file exists, reading and loading
+            Serial.println("reading config file");
+            File configFile = SPIFFS.open("/config.json", "r");
+            if (configFile) {
+                Serial.println("opened config file");
+                size_t size = configFile.size();
+                // Allocate a buffer to store contents of the file.
+                std::unique_ptr<char[]> buf(new char[size]);
+
+                configFile.readBytes(buf.get(), size);
+
+                DynamicJsonDocument json(1024);
+                auto deserializeError = deserializeJson(json, buf.get());
+                serializeJson(json, Serial);
+                if (!deserializeError) {
+                    Serial.println("\nparsed json");
+                    strcpy(mqtt_server, json["mqtt_server"]);
+                    strcpy(mqtt_port, json["mqtt_port"]);
+                    strcpy(mqtt_state_topic, json["mqtt_state_topic"]);
+                    strcpy(mqtt_cmnd_topic, json["mqtt_cmnd_topic"]);
+                    strcpy(mqtt_availability_topic, json["mqtt_availability_topic"]);
+                    strcpy(invert_servo, json["invert_servo"]);
+
+                } else {
+                    Serial.println("failed to load json config");
+                }
+                configFile.close();
+            }
+        }
+    } else {
+        Serial.println("failed to mount FS");
+    }
+    // end read
+
+    // The extra parameters to be configured (can be either global or just in the setup)
+    // After connecting, parameter.getValue() will get you the configured value
+    // id/name placeholder/prompt default length
+    WiFiManagerParameter custom_mqtt_server("server", "mqtt server", mqtt_server, 40);
+    WiFiManagerParameter custom_mqtt_port("port", "mqtt port", mqtt_port, 6);
+    WiFiManagerParameter custom_mqtt_state_topic("mqtt_state_topic", "mqtt state topic", mqtt_state_topic, 100);
+    WiFiManagerParameter custom_mqtt_cmnd_topic("mqtt_cmnd_topic", "mqtt command topic", mqtt_cmnd_topic, 100);
+    WiFiManagerParameter custom_mqtt_availability_topic("mqtt_availability_topic", "mqtt availability topic", mqtt_availability_topic, 100);
+    WiFiManagerParameter custom_invert_servo("invert_servo", "invert servo", invert_servo, 2);
+
+    // WiFiManager
+    // Local intialization. Once its business is done, there is no need to keep it around
+    WiFiManager wifiManager;
+
+    // set config save notify callback
+    wifiManager.setSaveConfigCallback(saveConfigCallback);
+
+    // set static ip
+    // wifiManager.setSTAStaticIPConfig(IPAddress(10, 0, 1, 99), IPAddress(10, 0, 1, 1), IPAddress(255, 255, 255, 0));
+
+    // add all your parameters here
+    wifiManager.addParameter(&custom_mqtt_server);
+    wifiManager.addParameter(&custom_mqtt_port);
+    wifiManager.addParameter(&custom_mqtt_state_topic);
+    wifiManager.addParameter(&custom_mqtt_cmnd_topic);
+    wifiManager.addParameter(&custom_mqtt_availability_topic);
+    wifiManager.addParameter(&custom_invert_servo);
+
+    // reset settings - for testing
+    // wifiManager.resetSettings();
+
+    if (!wifiManager.autoConnect("servopoti-config", "1234")) {
+        Serial.println("failed to connect and hit timeout");
+        delay(3000);
+        // reset and try again, or maybe put it to deep sleep
+        ESP.reset();
+        delay(5000);
+    }
+
+    // if you get here you have connected to the WiFi
+    Serial.println("connected...yeey :)");
+
+    // read updated parameters
+    strcpy(mqtt_server, custom_mqtt_server.getValue());
+    strcpy(mqtt_port, custom_mqtt_port.getValue());
+    strcpy(mqtt_state_topic, custom_mqtt_state_topic.getValue());
+    strcpy(mqtt_cmnd_topic, custom_mqtt_cmnd_topic.getValue());
+    strcpy(mqtt_availability_topic, custom_mqtt_availability_topic.getValue());
+    strcpy(invert_servo, custom_invert_servo.getValue());
+
+    Serial.println("The values in the file are: ");
+    Serial.println("\tmqtt_server : " + String(mqtt_server));
+    Serial.println("\tmqtt_port : " + String(mqtt_port));
+    Serial.println("\tmqtt_state_topic : " + String(mqtt_state_topic));
+    Serial.println("\tmqtt_cmnd_topic : " + String(mqtt_cmnd_topic));
+    Serial.println("\tmqtt_availability_topic : " + String(mqtt_availability_topic));
+    Serial.println("\tinvert_servo : " + String(invert_servo));
+
+    // save the custom parameters to FS
+    if (shouldSaveConfig) {
+        Serial.println("saving config");
+        DynamicJsonDocument json(1024);
+
+        json["mqtt_server"] = mqtt_server;
+        json["mqtt_port"] = mqtt_port;
+
+        File configFile = SPIFFS.open("/config.json", "w");
+        if (!configFile) {
+            Serial.println("failed to open config file for writing");
+        }
+        serializeJson(json, Serial);
+        serializeJson(json, configFile);
+        configFile.close();
+        // end save
+    }
+
+    Serial.println("local ip");
+    Serial.println(WiFi.localIP());
+
+    // Connect to MQTT and attach servo
     client.setServer(mqtt_server, 1883);
     client.setCallback(callback);
     attachServo();
-    Serial.begin(9600);
     calibration();
 }
 
@@ -135,6 +255,6 @@ void loop() {
     unsigned long now = millis();
     if (now - lastMsg > 2000) {
         lastMsg = now;
-        client.publish("outTopic", String(get_servo_state()).c_str());
+        client.publish(mqtt_state_topic, String(get_servo_state()).c_str());
     }
 }
