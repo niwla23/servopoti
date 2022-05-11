@@ -1,16 +1,12 @@
-#include <ESP8266WiFi.h>  //https://github.com/esp8266/Arduino
-// #include <FS.h>           //this needs to be first, or it all crashes and burns...
-#include "LittleFS.h"
-
-// needed for library
 #include <ArduinoJson.h>  //https://github.com/bblanchon/ArduinoJson
 #include <DNSServer.h>
 #include <ESP8266WebServer.h>
+#include <ESP8266WiFi.h>  //https://github.com/esp8266/Arduino
 #include <PubSubClient.h>
 #include <Servo.h>
 #include <WiFiManager.h>  //https://github.com/tzapu/WiFiManager
-#include "LittleFS.h"
 
+#include "LittleFS.h"
 
 // define your default values here, if there are different values in config.json, they are overwritten.
 char mqtt_server[40];
@@ -63,8 +59,8 @@ void calibration() {
     myservo.detach();
 }
 
-long get_servo_state() {
-    long value = map(analogRead(servoReadPin), servoValue0Deg, servoValue180Deg, 0, 100);
+int get_servo_state() {
+    int value = (int)map(analogRead(servoReadPin), servoValue0Deg, servoValue180Deg, 0, 100);
     if (strcmp(invert_servo, "1") == 0) {
         return 100 - value;
     } else {
@@ -142,6 +138,7 @@ void setup() {
                 configFile.readBytes(buf.get(), size);
 
                 DynamicJsonDocument json(1024);
+                Serial.println(buf.get());
                 auto deserializeError = deserializeJson(json, buf.get());
                 serializeJson(json, Serial);
                 if (!deserializeError) {
@@ -214,14 +211,6 @@ void setup() {
     strcpy(mqtt_availability_topic, custom_mqtt_availability_topic.getValue());
     strcpy(invert_servo, custom_invert_servo.getValue());
 
-    Serial.println("The values in the file are: ");
-    Serial.println("\tmqtt_server : " + String(mqtt_server));
-    Serial.println("\tmqtt_port : " + String(mqtt_port));
-    Serial.println("\tmqtt_state_topic : " + String(mqtt_state_topic));
-    Serial.println("\tmqtt_cmnd_topic : " + String(mqtt_cmnd_topic));
-    Serial.println("\tmqtt_availability_topic : " + String(mqtt_availability_topic));
-    Serial.println("\tinvert_servo : " + String(invert_servo));
-
     // save the custom parameters to FS
     if (shouldSaveConfig) {
         Serial.println("saving config");
@@ -229,6 +218,10 @@ void setup() {
 
         json["mqtt_server"] = mqtt_server;
         json["mqtt_port"] = mqtt_port;
+        json["mqtt_state_topic"] = mqtt_state_topic;
+        json["mqtt_cmnd_topic"] = mqtt_cmnd_topic;
+        json["mqtt_availability_topic"] = mqtt_availability_topic;
+        json["invert_servo"] = invert_servo;
 
         File configFile = LittleFS.open("/config.json", "w");
         if (!configFile) {
@@ -248,8 +241,10 @@ void setup() {
     client.setCallback(callback);
     attachServo();
     calibration();
+    write_servo(0);
 }
 
+int lastValue = -20;
 void loop() {
     if (!client.connected()) {
         reconnect();
@@ -257,8 +252,16 @@ void loop() {
     client.loop();
 
     unsigned long now = millis();
-    if (now - lastMsg > 2000) {
+    int read = get_servo_state();
+    if (read < lastValue - 2 || read > lastValue + 2) {
         lastMsg = now;
-        client.publish(mqtt_state_topic, String(get_servo_state()).c_str());
+        lastValue = read;
+        if (read < 6) {
+            read = 0;
+        } else if (read > 100) {
+            read = 100;
+        }
+        client.publish(mqtt_state_topic, String(read).c_str());
     }
+    delay(80);
 }
